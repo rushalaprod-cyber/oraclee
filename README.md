@@ -1,4 +1,4 @@
-# oraclee  ·  v2.0.0
+# oraclee  ·  v2.0.1
 
 **oraclee** transforme un sample audio en MIDI : batterie, basse, accords et mélodie séparés, vélocités, MIDI calé sur le BPM de ta session, et un piano roll façon FL Studio pour retoucher les notes avant de les glisser dans ton DAW.
 
@@ -93,7 +93,8 @@ Lancer le banc de précision :
 
 ```bash
 python3 Tools/bench/gen.py /tmp/bench
-python3 Tools/bench/score.py /tmp/bench build/sample2midi_artefacts/Release/oraclee-cli
+python3 Tools/bench/score.py /tmp/bench build/sample2midi_artefacts/Release/sample2midi
+python3 Tools/bench/gen_real.py /tmp/real && python3 Tools/bench/score_real.py /tmp/real build/sample2midi_artefacts/Release/sample2midi
 ```
 
 ## Comment ça marche, et limites
@@ -104,7 +105,8 @@ python3 Tools/bench/score.py /tmp/bench build/sample2midi_artefacts/Release/orac
   - estimation polyphonique itérative pour le reste ;
   - détection de l'accordage, du tempo et des attaques ;
   - répartition des notes par registre.
-- Score F1 sur le banc de test (4 boucles multi-instruments) : batterie 0,95, basse 0,88, accords 0,80, mélodie 0,79, tempo 4/4.
+- Banc de précision (sons synthétiques, vérités connues) : F1 0,89 sur 4 boucles multi-instruments (batterie 0,95, accords 0,92, basse 0,88, mélodie 0,81). Banc « réaliste » (réverb, nappes à attaque lente, vibrato, legato, pédale) : 0,65 sur les débuts de notes, 3 mini-notes parasites en tout (34 avant la v2.0.1).
+- Anti-parasites : hystérésis (une note commencée reste tenue tant que sa propre fondamentale est là), filtre des harmoniques fantômes, des miettes trop faibles et des glissés de legato, détection d'attaques douces, présence de batterie testée sur tout le fichier.
 - Deux instruments dans le même registre (piano et guitare, par exemple) finissent sur la même piste. Pour une séparation par timbre, sépare d'abord les stems, puis passe chaque stem dans oraclee.
 
 ## Licence

@@ -272,7 +272,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout Sample2MidiProcessor::create
     boolP ("sampleBpmAuto", fr ("BPM du sample auto"), true);
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "timing", 1 }, "Calage",
                                                    StringArray { "Caler sur le tempo de la session", fr ("Garder le temps réel") }, 0));
-    boolP ("followHost", "Jouer avec le DAW", true);
+    boolP ("followHost", "Jouer avec le DAW", false);
     boolP ("loop", "Boucler", true);
     for (int t = 0; t < mex::numTracks; ++t)
         boolP ("layer" + String (t), "Piste " + mex::trackName (t), true);

@@ -532,6 +532,13 @@ std::vector<Note> extractPoly (const std::vector<float>& x, const std::vector<fl
     std::vector<Peak> peaks;
     std::vector<float> buf (2 * F), rem;
     std::vector<std::vector<float>> act ((size_t) frames, std::vector<float> (128, 0.0f));
+    std::vector<std::vector<char>> held ((size_t) frames, std::vector<char> (128, 0)); // kept alive by hysteresis
+    std::vector<std::vector<float>> famp ((size_t) frames, std::vector<float> (128, 0.0f)); // fundamental amplitude
+    std::array<float, 128> fundPeak {};   // loudest fundamental of the note currently sounding on each pitch
+    std::array<int, 128> lastOn;
+    lastOn.fill (-1000);
+    const int holdGap = (int) std::round (0.07 * (kSr / hop));
+    const float contRatio = juce::Decibels::decibelsToGain (-14.0f - 4.0f * sens);
     float globalMaxSal = 0.0f;
 
     auto findPeak = [&] (double f, double tolSemis) -> int
@@ -660,12 +667,48 @@ std::vector<Note> extractPoly (const std::vector<float>& x, const std::vector<fl
                 rem[(size_t) idx] = std::max (0.0f, rem[(size_t) idx] - expected);
             }
         }
+
+        // Hysteresis: once a note has started, it keeps sounding as long as its own fundamental
+        // is still clearly there - even when a louder note dominates the frame (pad under a lead,
+        // chorus beating, a new attack elsewhere). Starting a note still needs the strict test above.
+        for (int p = s.minPitch; p <= s.maxPitch; ++p)
+        {
+            const int fi = findPeak (mtof (p), 0.45);
+            const float fa = fi >= 0 ? peaks[(size_t) fi].amp : 0.0f;
+            const float fres = fi >= 0 ? rem[(size_t) fi] : 0.0f; // not explained by the notes accepted in this frame
+            famp[(size_t) t][(size_t) p] = fa;
+            if (act[(size_t) t][(size_t) p] > 0.0f)
+            {
+                fundPeak[(size_t) p] = (t - lastOn[(size_t) p] > holdGap) ? fa : std::max (fundPeak[(size_t) p], fa);
+                lastOn[(size_t) p] = t;
+                continue;
+            }
+            if (t - lastOn[(size_t) p] > 2 || fi < 0)
+                continue;
+            if (fres >= std::max (gateAmp, contRatio * fundPeak[(size_t) p]))
+            {
+                held[(size_t) t][(size_t) p] = 1;
+                lastOn[(size_t) p] = t;
+            }
+        }
     }
 
     for (auto& fr : act)
         for (auto& v : fr)
             if (v < globalMaxSal * relToFrameMax * 0.25f)
                 v = 0.0f;
+    // held frames only extend notes that really exist: walk forward from real activations
+    for (int p = 0; p < 128; ++p)
+    {
+        bool alive = false;
+        int since = 1000;
+        for (int t = 0; t < frames; ++t)
+        {
+            if (act[(size_t) t][(size_t) p] > 0.0f) { alive = true; since = 0; continue; }
+            if (alive && held[(size_t) t][(size_t) p]) { act[(size_t) t][(size_t) p] = 1.0e-9f; since = 0; continue; }
+            if (++since > 2) alive = false;
+        }
+    }
 
     if (! prog (0.92f))
         return {};
@@ -677,6 +720,32 @@ std::vector<Note> extractPoly (const std::vector<float>& x, const std::vector<fl
     const int maxGap = (int) std::round (0.07 * fps); // bridge flickering detections; re-attacks are split below
     const double quarterWin = (N / 4) / kSr;
     const int snapRadius = (int) std::round (0.07 * fps);
+
+    // A real re-attack makes the note's own frequency jump within a few ms; chorus beating,
+    // tremolo or another instrument's hit only change it slowly. Short-window check at f0.
+    auto fastRise = [&] (int p, int o)
+    {
+        const double f0 = mtof (p);
+        auto magAt = [&] (double centreSec)
+        {
+            constexpr int W = 1024;
+            const long c = (long) std::llround (centreSec * kSr);
+            double re = 0.0, im = 0.0;
+            const double w = juce::MathConstants<double>::twoPi * f0 / kSr;
+            for (int i = 0; i < W; ++i)
+            {
+                const long idx = c - W / 2 + i;
+                if (idx < 0 || idx >= (long) xOnset.size()) continue;
+                const double win = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::twoPi * i / W);
+                re += xOnset[(size_t) idx] * win * std::cos (w * i);
+                im -= xOnset[(size_t) idx] * win * std::sin (w * i);
+            }
+            return std::sqrt (re * re + im * im);
+        };
+        const double t0 = o / fps + kOnsetLatency;
+        const double before = magAt (t0 - 0.035), after = std::max (magAt (t0 + 0.03), magAt (t0 + 0.05));
+        return after > 2.2 * std::max (before, 1.0e-9);
+    };
     const int attackFrames = (int) std::round (0.09 * fps);
 
     std::vector<Note> notes;
@@ -699,6 +768,17 @@ std::vector<Note> extractPoly (const std::vector<float>& x, const std::vector<fl
         {
             st = o / fps + kOnsetLatency;
             stFrame = o;
+        }
+        else
+        {
+            // soft attack (pad, swell, bowed...): walk back while the fundamental is still rising
+            const float plateau = famp[(size_t) juce::jmin (b, a + 6)][(size_t) p];
+            int k = a;
+            const int limit = juce::jmax (0, a - (int) std::round (0.45 * fps));
+            while (k - 1 >= limit && famp[(size_t) (k - 1)][(size_t) p] > 0.2f * plateau
+                   && famp[(size_t) (k - 1)][(size_t) p] <= famp[(size_t) k][(size_t) p] * 1.05f)
+                --k;
+            st = std::min (st, k / fps + 0.25 * quarterWin);
         }
         // attack loudness = strongest salience in the first ~90 ms
         float attack = 0.0f;
@@ -741,7 +821,8 @@ std::vector<Note> extractPoly (const std::vector<float>& x, const std::vector<fl
                 for (int k = o; k <= juce::jmin (b, o + 8); ++k) after = std::max (after, act[(size_t) k][(size_t) p]);
                 for (int k = segStart; k < o; ++k) sofar = std::max (sofar, act[(size_t) k][(size_t) p]);
                 // a real re-attack: the note had decayed (or stopped) and comes back clearly louder
-                if (after > 2.0f * before && before < 0.6f * sofar && after > 0.5f * sofar && o - segStart >= minFrames)
+                if (after > 2.0f * before && before < 0.6f * sofar && after > 0.5f * sofar && o - segStart >= minFrames
+                    && fastRise (p, o))
                 {
                     emit (p, segStart, o - 1 - (int) std::round (quarterWin * fps));
                     segStart = o - (int) std::round (quarterWin * fps);
@@ -895,6 +976,13 @@ std::vector<Note> extractMono (const std::vector<float>& x, const Settings& s, c
         Note n;
         n.pitch = (int) std::round (v[v.size() / 2]);
         n.start = a / fps;
+        // the pitch tracker needs a few frames to switch to a new note: use the real attack if close
+        for (int d = 0; d <= (int) std::round (0.08 * fps); ++d)
+        {
+            if (a - d >= 0 && onsets[(size_t) (a - d)]) { n.start = (a - d) / fps + kOnsetLatency * 0.5; break; }
+            if (d <= (int) std::round (0.02 * fps) && a + d < frames && onsets[(size_t) (a + d)]) { n.start = (a + d) / fps + kOnsetLatency * 0.5; break; }
+        }
+        n.start = std::max (0.0, n.start);
         n.end = (b + 1) / fps;
         n.strength = juce::Decibels::decibelsToGain (attack);
         notes.push_back (n);
@@ -970,7 +1058,94 @@ std::vector<Note> extractMono (const std::vector<float>& x, const Settings& s, c
     if (noteStart >= 0)
         emitSplit (noteStart, lastVoiced);
 
+    // one line at a time: a note ends where the next one begins
+    for (size_t i = 0; i + 1 < notes.size(); ++i)
+        if (notes[i].end > notes[i + 1].start)
+            notes[i].end = std::max (notes[i].start + 0.02, notes[i + 1].start);
+
     return notes;
+}
+
+//==============================================================================
+// Removes what is not a played note:
+//  - legato glitches: a very short note glued to a longer neighbour a semitone or two away
+//    (scoops, vibrato) is merged into that neighbour
+//  - harmonic ghosts: a short note sitting on an overtone (octave, 12th, 2 octaves, 17th...)
+//    of a louder note sounding at the same time
+//  - weak crumbs: short notes much quieter than the typical note of the file
+void removeGhostNotes (std::vector<Note>& notes, const Settings& s)
+{
+    std::vector<size_t> pitched;
+    for (size_t i = 0; i < notes.size(); ++i)
+        if (notes[i].track != drums) pitched.push_back (i);
+    if (pitched.size() < 2)
+        return;
+
+    const double shortSec = std::max (0.15, 2.0 * s.minNoteMs / 1000.0);
+    std::vector<float> str;
+    for (auto i : pitched) str.push_back (notes[i].strength);
+    std::nth_element (str.begin(), str.begin() + (long) str.size() / 2, str.end());
+    const float medianStrength = str[str.size() / 2];
+    const float weakRatio = 0.4f - 0.25f * s.sensitivity;
+
+    std::vector<bool> drop (notes.size(), false);
+    for (auto i : pitched)
+    {
+        auto& n = notes[i];
+        const double dur = n.end - n.start;
+        // long ghost: sits on an overtone of a much louder note for most of its life
+        if (dur >= shortSec)
+        {
+            for (auto j : pitched)
+            {
+                if (j == i || drop[j]) continue;
+                const auto& m = notes[j];
+                const int iv = n.pitch - m.pitch;
+                const bool overtone = iv == 12 || iv == 19 || iv == 24 || iv == 28 || iv == 31 || iv == 34 || iv == 36;
+                const double overlap = std::min (n.end, m.end) - std::max (n.start, m.start);
+                if (overtone && overlap > 0.7 * dur && n.strength < 0.3f * m.strength)
+                {
+                    drop[i] = true;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // legato glitch -> give its time to the neighbour
+        if (s.mode == Mode::mono)
+            for (auto j : pitched)
+            {
+                if (j == i || drop[j]) continue;
+                auto& m = notes[j];
+                if (m.end - m.start <= dur || std::abs (m.pitch - n.pitch) > 2) continue;
+                if (std::abs (m.start - n.end) < 0.03) { m.start = std::min (m.start, n.start); drop[i] = true; break; }
+                if (std::abs (n.start - m.end) < 0.03) { m.end = std::max (m.end, n.end); drop[i] = true; break; }
+            }
+        if (drop[i]) continue;
+
+        // overtone of a louder note sounding at the same time
+        for (auto j : pitched)
+        {
+            if (j == i || drop[j]) continue;
+            const auto& m = notes[j];
+            const int iv = n.pitch - m.pitch;
+            const bool overtone = iv == 12 || iv == 19 || iv == 24 || iv == 28 || iv == 31 || iv == 34 || iv == 36;
+            if (overtone && m.start <= n.start + 0.03 && m.end >= n.start + dur * 0.5 && m.strength >= n.strength * 0.8f)
+            {
+                drop[i] = true;
+                break;
+            }
+        }
+        if (drop[i]) continue;
+
+        if (n.strength < weakRatio * medianStrength)
+            drop[i] = true;
+    }
+    std::vector<Note> kept;
+    for (size_t i = 0; i < notes.size(); ++i)
+        if (! drop[i]) kept.push_back (notes[i]);
+    notes = std::move (kept);
 }
 
 //==============================================================================
@@ -1108,7 +1283,7 @@ Result analyse (const juce::AudioBuffer<float>& audio, double sampleRate, const 
                 }
             }
             auto bs = settings;
-            bs.maxPitch = settings.bassSplit;
+            bs.maxPitch = settings.bassSplit + 12;
             auto bassAll = extractMono (low, bs, Prog { progress, 0.45f, 0.6f });
             std::vector<Note> bassNotes;
             const float bassGate = juce::Decibels::decibelsToGain (-26.0f - 10.0f * settings.sensitivity);
@@ -1209,6 +1384,7 @@ Result analyse (const juce::AudioBuffer<float>& audio, double sampleRate, const 
     if (progress && ! progress (0.96f))
         return r;
 
+    removeGhostNotes (notes, settings);
     assignLayers (notes, settings);
     assignVelocities (notes);
     std::sort (notes.begin(), notes.end(), [] (const Note& a, const Note& b)

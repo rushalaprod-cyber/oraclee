@@ -102,6 +102,8 @@ int test (juce::AudioPluginFormat& fmt, const juce::String& id, const juce::File
         juce::MessageManager::getInstance()->runDispatchLoopUntil (40);
         midi.clear(); inst->processBlock (buf, midi);
     }
+    for (auto* prm : inst->getParameters())   // "Jouer avec le DAW" is off by default
+        if (prm->getName (64) == "Jouer avec le DAW") prm->setValueNotifyingHost (1.0f);
     head.playing = true;
     int on[17] {};
     for (int b = 0; b < 48000 * 8 / 512; ++b)
