@@ -35,9 +35,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp -R build/Oraclee_artefacts/Release/VST3/* dist/ 2>/dev/null || true
-          cp -R build/Oraclee_artefacts/Release/AU/* dist/ 2>/dev/null || true
-          cp -R build/Oraclee_artefacts/Release/Standalone/* dist/ 2>/dev/null || true
+          # only what users install: the plug-in bundles and the standalone app
+          # (no linker leftovers such as .lib / .exp / .pdb)
+          A=build/Oraclee_artefacts/Release
+          for f in "$A"/VST3/*.vst3 "$A"/AU/*.component "$A"/Standalone/*.app "$A"/Standalone/*.exe; do
+            [ -e "$f" ] && cp -R "$f" dist/
+          done
           ls -la dist
 
       - uses: actions/upload-artifact@v4
